@@ -40,6 +40,7 @@ class MainActivity : AppCompatActivity() {
 
     private var isDesktopMode = false
     private var currentTextZoom = 110
+    private val debugLogs = mutableListOf<String>()
 
     private val smsConsentLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -71,10 +72,16 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun logEvent(msg: String) {
+        if (debugLogs.size > 40) debugLogs.removeAt(0)
+        debugLogs.add(msg)
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        WebView.setWebContentsDebuggingEnabled(true)
         prefs = getSharedPreferences("census_helper_prefs", MODE_PRIVATE)
 
         val root = LinearLayout(this).apply {
@@ -92,39 +99,42 @@ class MainActivity : AppCompatActivity() {
             return Button(this).apply {
                 text = label
                 textSize = 11f
-                setPadding(6, 4, 6, 4)
+                setPadding(4, 4, 4, 4)
                 layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, weight).apply {
-                    setMargins(3, 0, 3, 0)
+                    setMargins(2, 0, 2, 0)
                 }
                 setOnClickListener { onClick() }
             }
         }
 
-        toolbar.addView(makeBtn("↻", 0.7f) {
-            Toast.makeText(this, "Reloading...", Toast.LENGTH_SHORT).show()
-            webView.loadUrl(webView.url ?: targetUrl)
+        toolbar.addView(makeBtn("↻", 0.6f) {
+            logEvent("Manual reload")
+            loadTarget(webView.url ?: targetUrl)
         })
-        toolbar.addView(makeBtn("A-", 0.7f) {
+        toolbar.addView(makeBtn("A-", 0.6f) {
             currentTextZoom = (currentTextZoom - 10).coerceAtLeast(80)
             webView.settings.textZoom = currentTextZoom
         })
-        toolbar.addView(makeBtn("A+", 0.7f) {
+        toolbar.addView(makeBtn("A+", 0.6f) {
             currentTextZoom = (currentTextZoom + 10).coerceAtMost(160)
             webView.settings.textZoom = currentTextZoom
         })
-        toolbar.addView(makeBtn("Restore", 1.1f) {
+        toolbar.addView(makeBtn("Restore", 1.0f) {
             val saved = prefs.getString("draft_json", "") ?: ""
             val escaped = saved.replace("\\", "\\\\").replace("'", "\\'")
             webView.evaluateJavascript("window.__restoreCensusDraft && window.__restoreCensusDraft('$escaped');", null)
         })
-        toolbar.addView(makeBtn("PC", 0.8f) {
+        toolbar.addView(makeBtn("PC", 0.7f) {
             isDesktopMode = !isDesktopMode
             webView.settings.userAgentString = if (isDesktopMode) desktopChromeUA else mobileChromeUA
             Toast.makeText(this, if (isDesktopMode) "Desktop Mode ON" else "Mobile Mode ON", Toast.LENGTH_SHORT).show()
-            webView.reload()
+            loadTarget(webView.url ?: targetUrl)
         })
-        toolbar.addView(makeBtn("ID/PDF", 1.0f) {
+        toolbar.addView(makeBtn("ID", 0.6f) {
             showSeIdOrPrintDialog()
+        })
+        toolbar.addView(makeBtn("Log", 0.7f) {
+            showDebugDialog()
         })
 
         progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
@@ -150,7 +160,13 @@ class MainActivity : AppCompatActivity() {
         requestLocationIfNeeded()
         setupBackGuard()
 
-        webView.loadUrl(targetUrl)
+        loadTarget(targetUrl)
+    }
+
+    private fun loadTarget(url: String) {
+        val headers = mapOf("X-Requested-With" to "")
+        logEvent("Loading: $url")
+        webView.loadUrl(url, headers)
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -163,7 +179,11 @@ class MainActivity : AppCompatActivity() {
             javaScriptEnabled = true
             domStorageEnabled = true
             databaseEnabled = true
+            allowFileAccess = true
+            allowContentAccess = true
+            loadsImagesAutomatically = true
             javaScriptCanOpenWindowsAutomatically = true
+            cacheMode = WebSettings.LOAD_DEFAULT
             mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
             userAgentString = mobileChromeUA
             setGeolocationEnabled(true)
@@ -183,20 +203,33 @@ class MainActivity : AppCompatActivity() {
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
+                logEvent("Finished: $url")
                 cookieManager.flush()
                 try {
                     val jsCode = assets.open("enhancer.js").bufferedReader().use { it.readText() }
                     webView.evaluateJavascript(jsCode, null)
-                } catch (_: Exception) {}
+                } catch (e: Exception) {
+                    logEvent("JS inject err: ${e.message}")
+                }
             }
 
             @SuppressLint("WebViewClientOnReceivedSslError")
             override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
+                logEvent("SSL err: ${error?.primaryError} on ${error?.url}")
                 if (error?.url?.contains("census.gov.in") == true) {
                     handler?.proceed()
                 } else {
                     handler?.cancel()
                 }
+            }
+
+            override fun onReceivedHttpError(
+                view: WebView?,
+                request: WebResourceRequest?,
+                errorResponse: WebResourceResponse?
+            ) {
+                super.onReceivedHttpError(view, request, errorResponse)
+                logEvent("HTTP ${errorResponse?.statusCode}: ${request?.url}")
             }
 
             override fun onReceivedError(
@@ -205,10 +238,11 @@ class MainActivity : AppCompatActivity() {
                 error: WebResourceError?
             ) {
                 super.onReceivedError(view, request, error)
+                logEvent("Net err ${error?.errorCode}: ${error?.description} (${request?.url})")
                 if (request?.isForMainFrame == true) {
                     Toast.makeText(
                         this@MainActivity,
-                        "Site error: ${error?.description} (${error?.errorCode}). Tap ↻ to retry.",
+                        "Site error: ${error?.description} (${error?.errorCode})",
                         Toast.LENGTH_LONG
                     ).show()
                 }
@@ -219,6 +253,13 @@ class MainActivity : AppCompatActivity() {
             override fun onProgressChanged(view: WebView?, newProgress: Int) {
                 progressBar.visibility = if (newProgress < 100) View.VISIBLE else View.GONE
                 progressBar.progress = newProgress
+            }
+
+            override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
+                if (consoleMessage != null) {
+                    logEvent("JS [${consoleMessage.messageLevel()}]: ${consoleMessage.message()}")
+                }
+                return super.onConsoleMessage(consoleMessage)
             }
 
             override fun onGeolocationPermissionsShowPrompt(
@@ -236,12 +277,33 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun showDebugDialog() {
+        webView.evaluateJavascript("document.documentElement ? document.documentElement.innerText.slice(0, 200) : 'EMPTY'") { snippet ->
+            val report = buildString {
+                append("URL: ${webView.url}\n")
+                append("Text: $snippet\n\n")
+                append("--- LOGS ---\n")
+                append(debugLogs.joinToString("\n"))
+            }
+            AlertDialog.Builder(this)
+                .setTitle("Debug Log")
+                .setMessage(report)
+                .setPositiveButton("Copy Log") { _, _ ->
+                    val clip = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    clip.setPrimaryClip(ClipData.newPlainText("CensusLog", report))
+                    Toast.makeText(this, "Copied log!", Toast.LENGTH_SHORT).show()
+                }
+                .setNegativeButton("Close", null)
+                .show()
+        }
+    }
+
     private fun checkMaintenanceWindow() {
         val hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
         if (hour in 0..5) {
             AlertDialog.Builder(this)
                 .setTitle("Portal Maintenance Hours (12 AM – 6 AM)")
-                .setMessage("se.census.gov.in is usually offline between 12 AM and 6 AM. Best times to fill the form are 6–8 AM or after 10 PM.")
+                .setMessage("se.census.gov.in is usually offline between 12 AM and 6 AM.")
                 .setPositiveButton("Try Anyway", null)
                 .show()
         }
