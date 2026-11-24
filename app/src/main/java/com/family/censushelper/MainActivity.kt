@@ -6,14 +6,17 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.content.*
 import android.content.pm.PackageManager
+import android.net.http.SslError
 import android.os.*
 import android.print.PrintAttributes
 import android.print.PrintManager
 import android.view.Gravity
+import android.view.View
 import android.view.WindowManager
 import android.webkit.*
 import android.widget.Button
 import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
@@ -28,12 +31,16 @@ import java.util.Calendar
 class MainActivity : AppCompatActivity() {
 
     private lateinit var webView: WebView
+    private lateinit var progressBar: ProgressBar
     private lateinit var prefs: SharedPreferences
+
     private val targetUrl = "https://se.census.gov.in/"
+    private val mobileChromeUA = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
+    private val desktopChromeUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+
     private var isDesktopMode = false
     private var currentTextZoom = 110
 
-    // Handles the 1-tap "Allow" OTP SMS dialog
     private val smsConsentLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -70,7 +77,6 @@ class MainActivity : AppCompatActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         prefs = getSharedPreferences("census_helper_prefs", MODE_PRIVATE)
 
-        // Root Vertical Layout: Parent Helper Toolbar + WebView
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
         }
@@ -78,48 +84,54 @@ class MainActivity : AppCompatActivity() {
         val toolbar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setBackgroundColor(0xFF0D47A1.toInt())
-            setPadding(8, 8, 8, 8)
+            setPadding(6, 8, 6, 8)
             gravity = Gravity.CENTER_VERTICAL
         }
 
-        fun makeBtn(label: String, onClick: () -> Unit): Button {
+        fun makeBtn(label: String, weight: Float = 1f, onClick: () -> Unit): Button {
             return Button(this).apply {
                 text = label
-                textSize = 12f
-                setPadding(12, 4, 12, 4)
-                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-                    setMargins(4, 0, 4, 0)
+                textSize = 11f
+                setPadding(6, 4, 6, 4)
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, weight).apply {
+                    setMargins(3, 0, 3, 0)
                 }
                 setOnClickListener { onClick() }
             }
         }
 
-        toolbar.addView(makeBtn("A-") {
+        toolbar.addView(makeBtn("↻", 0.7f) {
+            Toast.makeText(this, "Reloading...", Toast.LENGTH_SHORT).show()
+            webView.loadUrl(webView.url ?: targetUrl)
+        })
+        toolbar.addView(makeBtn("A-", 0.7f) {
             currentTextZoom = (currentTextZoom - 10).coerceAtLeast(80)
             webView.settings.textZoom = currentTextZoom
         })
-        toolbar.addView(makeBtn("A+") {
+        toolbar.addView(makeBtn("A+", 0.7f) {
             currentTextZoom = (currentTextZoom + 10).coerceAtMost(160)
             webView.settings.textZoom = currentTextZoom
         })
-        toolbar.addView(makeBtn("Restore") {
+        toolbar.addView(makeBtn("Restore", 1.1f) {
             val saved = prefs.getString("draft_json", "") ?: ""
             val escaped = saved.replace("\\", "\\\\").replace("'", "\\'")
             webView.evaluateJavascript("window.__restoreCensusDraft && window.__restoreCensusDraft('$escaped');", null)
         })
-        toolbar.addView(makeBtn("Map/PC") {
+        toolbar.addView(makeBtn("PC", 0.8f) {
             isDesktopMode = !isDesktopMode
-            webView.settings.userAgentString = if (isDesktopMode) {
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-            } else {
-                WebSettings.getDefaultUserAgent(this)
-            }
-            Toast.makeText(this, if (isDesktopMode) "Desktop Mode ON (Better for Map)" else "Mobile Mode ON", Toast.LENGTH_SHORT).show()
+            webView.settings.userAgentString = if (isDesktopMode) desktopChromeUA else mobileChromeUA
+            Toast.makeText(this, if (isDesktopMode) "Desktop Mode ON" else "Mobile Mode ON", Toast.LENGTH_SHORT).show()
             webView.reload()
         })
-        toolbar.addView(makeBtn("ID/PDF") {
+        toolbar.addView(makeBtn("ID/PDF", 1.0f) {
             showSeIdOrPrintDialog()
         })
+
+        progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 10)
+            visibility = View.VISIBLE
+        }
 
         webView = WebView(this).apply {
             layoutParams = LinearLayout.LayoutParams(
@@ -128,6 +140,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         root.addView(toolbar)
+        root.addView(progressBar)
         root.addView(webView)
         setContentView(root)
 
@@ -149,6 +162,10 @@ class MainActivity : AppCompatActivity() {
         webView.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
+            databaseEnabled = true
+            javaScriptCanOpenWindowsAutomatically = true
+            mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+            userAgentString = mobileChromeUA
             setGeolocationEnabled(true)
             useWideViewPort = true
             loadWithOverviewMode = true
@@ -160,16 +177,50 @@ class MainActivity : AppCompatActivity() {
         webView.addJavascriptInterface(WebAppInterface(this), "AndroidBridge")
 
         webView.webViewClient = object : WebViewClient() {
+            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                return false
+            }
+
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
                 cookieManager.flush()
-                val jsCode = assets.open("enhancer.js").bufferedReader().use { it.readText() }
-                webView.evaluateJavascript(jsCode, null)
+                try {
+                    val jsCode = assets.open("enhancer.js").bufferedReader().use { it.readText() }
+                    webView.evaluateJavascript(jsCode, null)
+                } catch (_: Exception) {}
+            }
+
+            @SuppressLint("WebViewClientOnReceivedSslError")
+            override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
+                if (error?.url?.contains("census.gov.in") == true) {
+                    handler?.proceed()
+                } else {
+                    handler?.cancel()
+                }
+            }
+
+            override fun onReceivedError(
+                view: WebView?,
+                request: WebResourceRequest?,
+                error: WebResourceError?
+            ) {
+                super.onReceivedError(view, request, error)
+                if (request?.isForMainFrame == true) {
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Site error: ${error?.description} (${error?.errorCode}). Tap ↻ to retry.",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
             }
         }
 
-        // Enable GPS Geolocation for the Census Residence Map Pinning step
         webView.webChromeClient = object : WebChromeClient() {
+            override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                progressBar.visibility = if (newProgress < 100) View.VISIBLE else View.GONE
+                progressBar.progress = newProgress
+            }
+
             override fun onGeolocationPermissionsShowPrompt(
                 origin: String?,
                 callback: GeolocationPermissions.Callback?
